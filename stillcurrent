@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 from datetime import date
 from fnmatch import fnmatchcase
+import hashlib
 import json
 from pathlib import Path
 import posixpath
@@ -13,7 +14,7 @@ import subprocess
 import sys
 from urllib.parse import unquote, urlsplit
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 WEIGHTS = {"knowledge": 40, "code_assets": 35, "artifacts": 25}
 CATEGORIES = ("docs", "decisions", "claims", "references", "artifact_rules")
 INLINE_LINK = re.compile(r"""!?\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s()]+))(?:\s+["'][^"']*["'])?\s*\)""")
@@ -267,10 +268,68 @@ def audit(snapshot, profile, today):
     ))
     return {
         "version": VERSION, "commit": snapshot.commit, "as_of": today.isoformat(),
+        "profile_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
         "scope": profile.get("scope", "Default tracked-file checks"),
         "tracked_entries": len(snapshot.paths), "score": overall, "areas": areas,
         "checks": results,
     }
+
+
+def compare(baseline, current, requested):
+    if not isinstance(baseline, dict):
+        raise ValueError("Expected a JSON audit object as the comparison baseline")
+    for field in ("version", "as_of", "scope", "profile_sha256"):
+        if baseline.get(field) != current[field]:
+            raise ValueError(f"Baseline {field} differs. Rescan both commits with the same settings.")
+    if baseline.get("commit") == current["commit"]:
+        raise ValueError("The baseline and candidate must be different commits")
+
+    def by_id(report):
+        checks = {row["id"]: row["status"] for row in report["checks"]}
+        if len(checks) != len(report["checks"]) or set(checks.values()) - {"pass", "fail", "unknown"}:
+            raise ValueError("Invalid audit check IDs or states")
+        return checks
+
+    before, after = by_id(baseline), by_id(current)
+    if before.keys() != after.keys():
+        raise ValueError("Audit check IDs changed. Use an explicit fixed checklist for both scans.")
+    targets = sorted(set(requested) or {key for key, status in before.items() if status == "fail"})
+    for key in targets:
+        if before.get(key) != "fail":
+            raise ValueError(f"Finding was not a failure in the baseline: {key}")
+
+    resolved = sorted(key for key in targets if after[key] == "pass")
+    remaining = sorted(set(targets) - set(resolved))
+    regressions = [
+        {"id": key, "before": before[key], "after": after[key]}
+        for key in sorted(before)
+        if before[key] != after[key] and after[key] in {"fail", "unknown"}
+    ]
+    return {
+        "baseline_commit": baseline["commit"],
+        "candidate_commit": current["commit"],
+        "baseline_score": baseline["score"],
+        "candidate_score": current["score"],
+        "resolved": resolved,
+        "remaining": remaining,
+        "regressions": regressions,
+        "verified": bool(resolved) and not remaining and not regressions,
+    }
+
+
+def comparison_text(result):
+    print("Cleanup comparison: " + ("verified" if result["verified"] else "unverified"))
+    print(f"{result['baseline_commit'][:12]} → {result['candidate_commit'][:12]}")
+    scores = [f"{result[key]:g}/100" if result[key] is not None else "withheld"
+              for key in ("baseline_score", "candidate_score")]
+    print(f"Score: {scores[0]} → {scores[1]}")
+    for key in result["resolved"]:
+        print(f"Resolved · {key}")
+    for key in result["remaining"]:
+        print(f"Still open · {key}")
+    for item in result["regressions"]:
+        print(f"Regression · {item['id']} ({item['before']} → {item['after']})")
+    print("Comparison covers scanner checks. Attach affected workflow verification separately.")
 
 
 def markdown(report):
@@ -338,12 +397,25 @@ def main():
     parser.add_argument("--profile", help="JSON profile (defaults to .stillcurrent.json in the snapshot)")
     parser.add_argument("--format", choices=("terminal", "markdown", "json"), default="terminal")
     parser.add_argument("--as-of", type=date.fromisoformat, default=date.today(), help="date for retention checks")
+    parser.add_argument("--compare", help="baseline JSON audit to compare with the candidate snapshot")
+    parser.add_argument("--finding", action="append", default=[], help="baseline failure to verify (repeatable, requires --compare)")
     args = parser.parse_args()
+    if args.finding and not args.compare:
+        parser.error("--finding requires --compare")
     try:
         snapshot = Snapshot(args.repo, args.rev)
         report = audit(snapshot, load_profile(args.profile, snapshot), args.as_of)
+        result = compare(json.loads(Path(args.compare).read_text()), report, args.finding) if args.compare else None
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(2, f"stillcurrent: {error}\n")
+    if result is not None:
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            if args.format == "markdown":
+                print("# StillCurrent cleanup comparison\n")
+            comparison_text(result)
+        return 0 if result["verified"] else 1
     if args.format == "json":
         print(json.dumps(report, indent=2))
     elif args.format == "markdown":
@@ -366,4 +438,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
