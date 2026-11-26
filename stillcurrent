@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Read-only, commit-scoped repository hygiene audit."""
+
+import argparse
+from collections import Counter
+from datetime import date
+from fnmatch import fnmatchcase
+import json
+from pathlib import Path
+import posixpath
+import re
+import subprocess
+import sys
+from urllib.parse import unquote, urlsplit
+
+VERSION = "0.1.0"
+WEIGHTS = {"knowledge": 40, "code_assets": 35, "artifacts": 25}
+CATEGORIES = ("docs", "decisions", "claims", "references", "artifact_rules")
+INLINE_LINK = re.compile(r"""!?\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s()]+))(?:\s+["'][^"']*["'])?\s*\)""")
+DEFINITION = re.compile(r"""^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))""")
+FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+class Snapshot:
+    def __init__(self, root, revision):
+        self.root = Path(root).resolve()
+        self.commit = self.git("rev-parse", "--verify", "--end-of-options", revision + "^{commit}").decode().strip()
+        records = self.git("ls-tree", "-rz", self.commit).split(b"\0")
+        self.paths = {}
+        for record in filter(None, records):
+            metadata, path = record.split(b"\t", 1)
+            mode, _, oid = metadata.decode().split()
+            self.paths[path.decode("utf-8", "surrogateescape")] = (mode, oid)
+        self.cache = {}
+        self.directories = set()
+        for path in self.paths:
+            directory = posixpath.dirname(path)
+            while directory and directory not in self.directories:
+                self.directories.add(directory)
+                directory = posixpath.dirname(directory)
+
+    def git(self, *args, allow_no_match=False):
+        result = subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            capture_output=True,
+        )
+        if result.returncode and not (allow_no_match and result.returncode == 1):
+            raise ValueError(result.stderr.decode(errors="replace").strip() or "Git command failed")
+        return result.stdout
+
+    def read(self, path):
+        if path not in self.cache:
+            mode, oid = self.paths.get(path, ("", ""))
+            self.cache[path] = (
+                self.git("cat-file", "blob", oid).decode(errors="replace")
+                if mode in {"100644", "100755"} else None
+            )
+        return self.cache[path]
+
+    def exists(self, path):
+        return path in self.paths or path in self.directories or path == "."
+
+    def references(self, token, paths, excluded):
+        output = self.git(
+            "grep", "--full-name", "-n", "-z", "-I", "-F", "-e", token,
+            self.commit, "--", *paths, allow_no_match=True,
+        )
+        references = set()
+        while output:
+            path, number, tail = output.split(b"\0", 2)
+            _, _, output = tail.partition(b"\n")
+            name = path.decode(errors="replace").removeprefix(self.commit + ":")
+            if name != excluded:
+                references.add((name, int(number)))
+        return sorted(references)
+
+
+def location(path, line=1):
+    return {"path": path, "line": line}
+
+
+def check(rule, identifier, area, status, title, fix, evidence, impact="medium", critical=False):
+    return {
+        "id": f"{rule}:{identifier}", "area": area, "status": status,
+        "impact": impact, "critical": critical, "title": title,
+        "next_step": fix, "evidence": evidence,
+    }
+
+
+def literal_lines(content, needle):
+    return [number for number, line in enumerate((content or "").splitlines(), 1) if needle in line]
+
+
+def links(content):
+    fence = ""
+    for number, line in enumerate(content.splitlines(), 1):
+        match = FENCE.match(line)
+        if match:
+            marker = match[1]
+            if not fence:
+                fence = marker
+            elif marker.startswith(fence) and not line[match.end():].strip():
+                fence = ""
+            continue
+        if fence or line.startswith(("    ", "\t")):
+            continue
+        line = re.sub(r"`+[^`]*`+", "", line)
+        definition = DEFINITION.match(line)
+        if definition:
+            yield number, next(group for group in definition.groups() if group)
+        for inline in INLINE_LINK.finditer(line):
+            yield number, next(group for group in inline.groups() if group)
+
+
+def local_path(source, target):
+    try:
+        url = urlsplit(target)
+    except ValueError:
+        return None
+    if url.scheme or url.netloc or not url.path:
+        return None
+    path = unquote(url.path)
+    parent = "" if path.startswith("/") else posixpath.dirname(source)
+    return posixpath.normpath(posixpath.join(parent, path.lstrip("/")))
+
+
+def decision_metadata(content):
+    if content is None or not content.startswith("---\n"):
+        return {}
+    first, separator, _ = content[4:].partition("\n---")
+    return dict(re.findall(r"(?m)^(status|superseded_by):[ \t]*(.+)$", first)) if separator else {}
+
+
+def audit_decision(snapshot, path):
+    visited = [path]
+    while True:
+        metadata = decision_metadata(snapshot.read(visited[-1]))
+        status = metadata.get("status", "").strip()
+        if status == "current":
+            outcome = "pass"
+            title = "Decision resolves to a current record"
+            break
+        target = local_path(visited[-1], metadata.get("superseded_by", "").strip())
+        if status != "superseded" or not target or target in visited:
+            outcome = "fail"
+            title = "Decision does not resolve to a current record"
+            break
+        visited.append(target)
+    return check(
+        "decision", path, "knowledge", outcome, title,
+        "Label the current record and link superseded records to their replacement.",
+        [location(record) for record in visited], "high",
+    )
+
+
+def audit_doc(snapshot, path):
+    content = snapshot.read(path)
+    if content is None:
+        return [check("doc", path, "knowledge", "unknown", "Could not inspect configured guide",
+                      "Update the guide path and rerun the scan.", [location(path)])]
+    missing = []
+    for line, target in links(content):
+        resolved = local_path(path, target)
+        if resolved is not None and not snapshot.exists(resolved):
+            missing.append({**location(path, line), "target": resolved})
+    result = check(
+        "doc", path, "knowledge", "fail" if missing else "pass",
+        "Guide links to missing tracked paths" if missing else "Guide’s local paths resolve",
+        "Update each link to its current destination.", missing or [location(path)],
+    )
+    return [result]
+
+
+def audit_claim(snapshot, rule):
+    path, witness = rule["path"], rule["witness_path"]
+    content = snapshot.read(path)
+    current = literal_lines(snapshot.read(witness), rule["witness_contains"])
+    old = literal_lines(content, rule["stale_contains"])
+    if content is None or not current:
+        status = "unknown"
+    else:
+        status = "fail" if old else "pass"
+    return check(
+        "claim", rule["id"], "knowledge", status, rule["title"], rule["next_step"],
+        [*(location(path, line) for line in old[:12] or [1]), location(witness, current[0] if current else 1)],
+        rule.get("impact", "high"), rule.get("critical", False),
+    )
+
+
+def audit_reference(snapshot, rule):
+    path, token = rule["path"], rule.get("token", rule["path"])
+    refs = snapshot.references(token, rule["search"], path)
+    marker = rule.get("path_contains")
+    lines = literal_lines(snapshot.read(path), marker) if marker else [1]
+    evidence = [location(path, lines[0] if lines else 1), *(location(name, line) for name, line in refs[:12])]
+    policy = rule["expectation"]
+    if policy == "retained":
+        status = "pass" if path in snapshot.paths and lines and refs else "unknown"
+        title = rule.get("title", "Compatibility dependency has a retained file and witness")
+        fix = rule.get("next_step", "Preserve the dependency and verify it before removal.")
+    elif policy == "retire":
+        status = "pass" if path not in snapshot.paths and not refs else "unknown"
+        if refs:
+            status = "fail"
+            title = "Retirement candidate still has references"
+        else:
+            title = "No references found in configured search scope" if status == "unknown" else "Retired path is absent"
+        if status == "unknown":
+            title = rule.get("title", title)
+        fix = rule.get("next_step", "Verify indirect and external consumers before retirement.")
+    else:
+        status = "fail" if refs else ("pass" if path not in snapshot.paths else "unknown")
+        title = "Runtime or build references still use a legacy location" if refs else "No legacy references found"
+        fix = "Move the dependency with its callers and verify the packaged workflow."
+    result = check("reference", rule["id"], "code_assets", status, title, fix, evidence,
+                   rule.get("impact", "high"), rule.get("critical", False))
+    result["reference_count"] = len(refs)
+    return result
+
+
+def audit_artifact(snapshot, rule, today):
+    matches = sorted(path for path in snapshot.paths if any(
+        fnmatchcase(path, pattern) for pattern in rule["patterns"]
+    ))
+    if rule.get("retain_until") and today <= date.fromisoformat(rule["retain_until"]):
+        matches = []
+    title = rule["title"]
+    result = check(
+        "artifact", rule["id"], "artifacts", "fail" if matches else "pass", title,
+        rule["next_step"], [location(path) for path in matches[:20]], rule.get("impact", "low"),
+    )
+    result["match_count"] = len(matches)
+    return result
+
+
+def audit(snapshot, profile, today):
+    defaults = [
+        {"id": "python-cache", "patterns": ["*.pyc", "*.pyo"],
+         "title": "Tracked Python bytecode", "next_step": "Verify and untrack generated bytecode."},
+        {"id": "finder", "patterns": [".DS_Store", "*/.DS_Store"],
+         "title": "Tracked Finder metadata", "next_step": "Untrack Finder metadata."},
+    ]
+    docs = profile.get("docs", [p for p in ("README.md", "AGENTS.md") if p in snapshot.paths])
+    checks = [result for path in docs for result in audit_doc(snapshot, path)]
+    checks.extend(audit_decision(snapshot, path) for path in profile.get("decisions", []))
+    checks.extend(audit_claim(snapshot, rule) for rule in profile.get("claims", []))
+    checks.extend(audit_reference(snapshot, rule) for rule in profile.get("references", []))
+    checks.extend(audit_artifact(snapshot, rule, today) for rule in defaults + profile.get("artifact_rules", []))
+    areas = {}
+    for area in WEIGHTS:
+        counts = Counter(item["status"] for item in checks if item["area"] == area)
+        evaluated = counts["pass"] + counts["fail"]
+        total = evaluated + counts["unknown"]
+        areas[area] = {
+            "passed": counts["pass"], "failed": counts["fail"], "unknown": counts["unknown"],
+            "score": round(100 * counts["pass"] / evaluated, 1) if evaluated else None,
+            "coverage": round(100 * evaluated / total, 1) if total else None,
+        }
+    adequate = all(area["coverage"] is not None and area["coverage"] >= 80 for area in areas.values())
+    overall = None
+    if adequate and not any(c["critical"] and c["status"] == "unknown" for c in checks):
+        overall = round(sum(areas[area]["score"] * weight / 100 for area, weight in WEIGHTS.items()), 1)
+    results = sorted(checks, key=lambda item: (
+        ("fail", "unknown", "pass").index(item["status"]),
+        ("high", "medium", "low").index(item["impact"]),
+        item["id"],
+    ))
+    return {
+        "version": VERSION, "commit": snapshot.commit, "as_of": today.isoformat(),
+        "scope": profile.get("scope", "Default tracked-file checks"),
+        "tracked_entries": len(snapshot.paths), "score": overall, "areas": areas,
+        "checks": results,
+    }
+
+
+def markdown(report):
+    score = report["score"]
+    print("# StillCurrent audit")
+    print(f"\nCommit `{report['commit']}` · {report['as_of']} · scanner {report['version']}")
+    print(f"\nScope: {report['scope']} ({report['tracked_entries']} tracked entries in the snapshot)")
+    print("\n**Score:** " + (f"{score:g}/100" if score is not None else "Withheld for incomplete coverage"))
+    print("\n| Area | Score | Coverage | Pass / fail / unknown |")
+    print("| --- | ---: | ---: | ---: |")
+    for name, row in report["areas"].items():
+        score = f"{row['score']:g}/100" if row["score"] is not None else "Unscored"
+        coverage = f"{row['coverage']:g}%" if row["coverage"] is not None else "Outside configured checks"
+        print(f"| {name.replace('_', ' ').title()} | {score} | {coverage} | "
+              f"{row['passed']} / {row['failed']} / {row['unknown']} |")
+    for item in report["checks"]:
+        if item["status"] == "pass" and not item["critical"]:
+            continue
+        status = {"pass": "Verified", "fail": "Finding", "unknown": "Investigate"}[item["status"]]
+        print(f"\n### {status} · {item['title']}\n")
+        print(f"{item['next_step']}  ")
+        print(f"ID: `{item['id']}` · impact: {item['impact']}\n")
+        for ref in item["evidence"]:
+            target = f" → `{ref['target']}`" if "target" in ref else ""
+            print(f"- `{ref['path']}:{ref['line']}`{target}")
+
+
+def load_profile(path, snapshot):
+    content = Path(path).read_text() if path else snapshot.read(".stillcurrent.json")
+    if content is None:
+        return {}
+    profile = json.loads(content)
+    if not isinstance(profile, dict) or set(profile) - {"scope", *CATEGORIES}:
+        raise ValueError("Unexpected profile keys. See the profile example in the README.")
+    for key in CATEGORIES:
+        if key in profile and not isinstance(profile[key], list):
+            raise ValueError(f"Profile field {key} must be a list")
+    for key in ("docs", "decisions"):
+        paths = profile.get(key, [])
+        if not all(isinstance(path, str) and path for path in paths) or len(set(paths)) != len(paths):
+            raise ValueError(f"{key} must contain unique, nonempty paths")
+    for key in ("claims", "references", "artifact_rules"):
+        rules = profile.get(key, [])
+        ids = [rule["id"] for rule in rules]
+        if not all(isinstance(value, str) and value for value in ids) or len(set(ids)) != len(ids):
+            raise ValueError(f"{key} must contain unique, nonempty rule IDs")
+        if key == "artifact_rules" and {"python-cache", "finder"}.intersection(ids):
+            raise ValueError("Artifact IDs python-cache and finder are reserved")
+        if any(rule.get("impact", "low") not in {"high", "medium", "low"} for rule in rules):
+            raise ValueError(f"{key} impact must be high, medium, or low")
+    if any(not isinstance(rule["search"], list) or not rule["search"]
+           for rule in profile.get("references", [])):
+        raise ValueError("Each reference rule needs a nonempty search path list")
+    if any(rule["expectation"] not in {"retained", "retire", "move"}
+           for rule in profile.get("references", [])):
+        raise ValueError("Reference expectation must be retained, retire, or move")
+    return profile
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("repo", nargs="?", default=".", help="local Git checkout")
+    parser.add_argument("--rev", default="HEAD", help="Git commit, tag, or branch to audit")
+    parser.add_argument("--profile", help="JSON profile (defaults to .stillcurrent.json in the snapshot)")
+    parser.add_argument("--format", choices=("terminal", "markdown", "json"), default="terminal")
+    parser.add_argument("--as-of", type=date.fromisoformat, default=date.today(), help="date for retention checks")
+    args = parser.parse_args()
+    try:
+        snapshot = Snapshot(args.repo, args.rev)
+        report = audit(snapshot, load_profile(args.profile, snapshot), args.as_of)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        parser.exit(2, f"stillcurrent: {error}\n")
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    elif args.format == "markdown":
+        markdown(report)
+    else:
+        score = report["score"]
+        print(f"StillCurrent {report['commit'][:12]} | {report['scope']}")
+        print(f"Score: {score:g}/100" if score is not None else "Score withheld: incomplete coverage")
+        for name, row in report["areas"].items():
+            coverage = f"{row['coverage']:g}%" if row["coverage"] is not None else "outside configured checks"
+            score = f"{row['score']:g}" if row["score"] is not None else "unscored"
+            print(f"{name:12} score={score} coverage={coverage} "
+                  f"(pass={row['passed']} fail={row['failed']} unknown={row['unknown']})")
+        for item in report["checks"]:
+            if item["status"] != "pass":
+                ref = next(iter(item["evidence"]), None)
+                where = f" [{ref['path']}:{ref['line']}]" if ref else ""
+                print(f"{item['status'].upper():7} {item['id']}{where} · {item['title']}")
+        print("Use --format markdown for evidence and suggested actions.")
+
+
+if __name__ == "__main__":
+    main()
