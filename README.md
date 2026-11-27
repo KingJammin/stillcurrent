@@ -49,6 +49,21 @@ Run both scans with the same CLI version, profile, and date. Use explicit check 
   --as-of 2026-11-25 --compare before.json --finding doc:README.md
 ```
 
-Repeat `--finding` for a group of related failures. With no IDs, comparison evaluates every baseline failure. It verifies that the selected checks moved from fail to pass and that no other check became a failure or lost evidence. The score may be withheld even when the targeted cleanup is verified. Comparison exits 0 for verified, 1 for unverified, and 2 for incompatible scans or invalid input.
+Repeat `--finding` to verify several fixes. A check ID such as `doc:README.md` requires the whole check to pass. To verify one issue under a check, use its individual ID from the baseline JSON `findings` list. Without IDs, comparison evaluates every failed baseline check.
+
+New individual findings or checks that lose evidence block verification even when the score stays the same. JSON comparisons include `new_findings`, `resolved_findings`, and check status changes in `regressions`. Finding IDs use the check, affected path, link target when present, and occurrence count for repeated matches. Moving a line alone keeps its ID. Multiple matches of the same rule and target in one file are tracked by count.
+
+Cleanup comparison exits 0 for verified, 1 for unverified, and 2 for incompatible scans or invalid input. When upgrading from 0.2.0 or changing profiles, rescan the original baseline commit before comparing.
 
 The [cleanup skill](.agents/skills/stillcurrent-cleanup/SKILL.md) guides AI agents through evidence review, scoped edits, and the repository’s own verification. Point an agent at the skill and the finding ID.
+
+## Compare recurring scans
+
+Save a JSON audit from each successful scan. Compare a new snapshot against the last successful audit using the same CLI version and profile.
+
+```sh
+./stillcurrent /path/to/checkout --rev CURRENT --profile /path/to/profile.json \
+  --as-of YYYY-MM-DD --compare previous.json --monitor --format json
+```
+
+Monitoring accepts the same commit and a later date so expired retention exceptions can surface even without new commits. Exit 1 means a new finding, a check regression, a score drop, or a coverage drop. Exit 0 means no alert. Save the candidate audit as the next baseline after either outcome. Exit 2 means the comparison failed. Keep the previous baseline in that case.

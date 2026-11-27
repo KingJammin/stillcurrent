@@ -14,7 +14,7 @@ import subprocess
 import sys
 from urllib.parse import unquote, urlsplit
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 WEIGHTS = {"knowledge": 40, "code_assets": 35, "artifacts": 25}
 CATEGORIES = ("docs", "decisions", "claims", "references", "artifact_rules")
 INLINE_LINK = re.compile(r"""!?\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s()]+))(?:\s+["'][^"']*["'])?\s*\)""")
@@ -183,7 +183,8 @@ def audit_claim(snapshot, rule):
         status = "fail" if old else "pass"
     return check(
         "claim", rule["id"], "knowledge", status, rule["title"], rule["next_step"],
-        [*(location(path, line) for line in old[:12] or [1]), location(witness, current[0] if current else 1)],
+        [location(path, line) for line in old] if status == "fail" else
+        [location(path), location(witness, current[0] if current else 1)],
         rule.get("impact", "high"), rule.get("critical", False),
     )
 
@@ -193,7 +194,6 @@ def audit_reference(snapshot, rule):
     refs = snapshot.references(token, rule["search"], path)
     marker = rule.get("path_contains")
     lines = literal_lines(snapshot.read(path), marker) if marker else [1]
-    evidence = [location(path, lines[0] if lines else 1), *(location(name, line) for name, line in refs[:12])]
     policy = rule["expectation"]
     if policy == "retained":
         status = "pass" if path in snapshot.paths and lines and refs else "unknown"
@@ -213,6 +213,9 @@ def audit_reference(snapshot, rule):
         status = "fail" if refs else ("pass" if path not in snapshot.paths else "unknown")
         title = "Runtime or build references still use a legacy location" if refs else "No legacy references found"
         fix = "Move the dependency with its callers and verify the packaged workflow."
+    evidence = [location(name, line) for name, line in refs]
+    if status != "fail":
+        evidence = [location(path, lines[0] if lines else 1), *evidence[:12]]
     result = check("reference", rule["id"], "code_assets", status, title, fix, evidence,
                    rule.get("impact", "high"), rule.get("critical", False))
     result["reference_count"] = len(refs)
@@ -228,10 +231,31 @@ def audit_artifact(snapshot, rule, today):
     title = rule["title"]
     result = check(
         "artifact", rule["id"], "artifacts", "fail" if matches else "pass", title,
-        rule["next_step"], [location(path) for path in matches[:20]], rule.get("impact", "low"),
+        rule["next_step"], [location(path) for path in matches], rule.get("impact", "low"),
     )
     result["match_count"] = len(matches)
     return result
+
+
+def individual_findings(checks):
+    findings = []
+    for item in checks:
+        if item["status"] != "fail":
+            continue
+        check_id = item["id"]
+        evidence = item["evidence"]
+        if check_id.startswith("decision:"):
+            evidence = evidence[:1]
+        occurrences = Counter()
+        for ref in evidence:
+            key = (ref["path"], ref.get("target"))
+            occurrences[key] += 1
+            identity = json.dumps((check_id, *key, occurrences[key]))
+            findings.append({
+                "id": "finding:" + hashlib.sha256(identity.encode()).hexdigest(),
+                "check_id": check_id, "impact": item["impact"], **ref,
+            })
+    return findings
 
 
 def audit(snapshot, profile, today):
@@ -271,17 +295,23 @@ def audit(snapshot, profile, today):
         "profile_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
         "scope": profile.get("scope", "Default tracked-file checks"),
         "tracked_entries": len(snapshot.paths), "score": overall, "areas": areas,
-        "checks": results,
+        "checks": results, "findings": individual_findings(results),
     }
 
 
-def compare(baseline, current, requested):
+def compare(baseline, current, requested, monitor=False):
     if not isinstance(baseline, dict):
         raise ValueError("Expected a JSON audit object as the comparison baseline")
-    for field in ("version", "as_of", "scope", "profile_sha256"):
+    for field in ("version", "scope", "profile_sha256"):
         if baseline.get(field) != current[field]:
             raise ValueError(f"Baseline {field} differs. Rescan both commits with the same settings.")
-    if baseline.get("commit") == current["commit"]:
+    baseline_date = date.fromisoformat(baseline["as_of"])
+    current_date = date.fromisoformat(current["as_of"])
+    if not monitor and baseline_date != current_date:
+        raise ValueError("Baseline as_of differs. Rescan both commits with the same settings.")
+    if monitor and baseline_date > current_date:
+        raise ValueError("Monitoring baseline is newer than the candidate scan")
+    if not monitor and baseline.get("commit") == current["commit"]:
         raise ValueError("The baseline and candidate must be different commits")
 
     def by_id(report):
@@ -293,42 +323,78 @@ def compare(baseline, current, requested):
     before, after = by_id(baseline), by_id(current)
     if before.keys() != after.keys():
         raise ValueError("Audit check IDs changed. Use an explicit fixed checklist for both scans.")
-    targets = sorted(set(requested) or {key for key, status in before.items() if status == "fail"})
-    for key in targets:
-        if before.get(key) != "fail":
-            raise ValueError(f"Finding was not a failure in the baseline: {key}")
-
-    resolved = sorted(key for key in targets if after[key] == "pass")
-    remaining = sorted(set(targets) - set(resolved))
+    old_findings = {item["id"]: item for item in baseline["findings"]}
+    new_findings = {item["id"]: item for item in current["findings"]}
+    added = [item for key, item in new_findings.items() if key not in old_findings]
+    fixed = [item for key, item in old_findings.items()
+             if key not in new_findings and after[item["check_id"]] != "unknown"]
+    fixed_ids = {item["id"] for item in fixed}
     regressions = [
         {"id": key, "before": before[key], "after": after[key]}
         for key in sorted(before)
         if before[key] != after[key] and after[key] in {"fail", "unknown"}
     ]
-    return {
+    result = {
+        "version": current["version"],
+        "profile_sha256": current["profile_sha256"],
         "baseline_commit": baseline["commit"],
         "candidate_commit": current["commit"],
+        "baseline_as_of": baseline["as_of"],
+        "candidate_as_of": current["as_of"],
         "baseline_score": baseline["score"],
         "candidate_score": current["score"],
-        "resolved": resolved,
-        "remaining": remaining,
         "regressions": regressions,
-        "verified": bool(resolved) and not remaining and not regressions,
+        "new_findings": added,
+        "resolved_findings": fixed,
     }
+    if monitor:
+        coverage_drops = {}
+        for name, area in baseline["areas"].items():
+            old, new = area["coverage"], current["areas"][name]["coverage"]
+            if old is not None and (new is None or new < old):
+                coverage_drops[name] = {"before": old, "after": new}
+        old, new = baseline["score"], current["score"]
+        score_dropped = old is not None and (new is None or new < old)
+        return {**result, "score_dropped": score_dropped, "coverage_drops": coverage_drops,
+                "alert": bool(regressions or added or coverage_drops or score_dropped)}
+
+    targets = sorted(set(requested) or {key for key, status in before.items() if status == "fail"})
+    resolved = []
+    for key in targets:
+        if key in old_findings:
+            if key in fixed_ids:
+                resolved.append(key)
+        elif before.get(key) == "fail":
+            if after[key] == "pass":
+                resolved.append(key)
+        else:
+            raise ValueError(f"Finding was not a failure in the baseline: {key}")
+    remaining = sorted(set(targets) - set(resolved))
+    return {**result, "resolved": resolved, "remaining": remaining,
+            "verified": bool(resolved) and not remaining and not regressions and not added}
 
 
 def comparison_text(result):
-    print("Cleanup comparison: " + ("verified" if result["verified"] else "unverified"))
+    if "alert" in result:
+        print("Monitoring comparison: " + ("needs attention" if result["alert"] else "no new issues"))
+    else:
+        print("Cleanup comparison: " + ("verified" if result["verified"] else "unverified"))
     print(f"{result['baseline_commit'][:12]} → {result['candidate_commit'][:12]}")
     scores = [f"{result[key]:g}/100" if result[key] is not None else "withheld"
               for key in ("baseline_score", "candidate_score")]
     print(f"Score: {scores[0]} → {scores[1]}")
-    for key in result["resolved"]:
+    for area, drop in result.get("coverage_drops", {}).items():
+        print(f"Coverage dropped · {area} ({drop['before']} → {drop['after']})")
+    for key in result.get("resolved", []):
         print(f"Resolved · {key}")
-    for key in result["remaining"]:
+    for key in result.get("remaining", []):
         print(f"Still open · {key}")
     for item in result["regressions"]:
         print(f"Regression · {item['id']} ({item['before']} → {item['after']})")
+    for field, label in (("new_findings", "New finding"), ("resolved_findings", "Cleared finding")):
+        for item in result[field]:
+            target = f" → {item['target']}" if "target" in item else ""
+            print(f"{label} · {item['check_id']} [{item['path']}:{item['line']}]{target} · {item['id']}")
     print("Comparison covers scanner checks. Attach affected workflow verification separately.")
 
 
@@ -398,14 +464,17 @@ def main():
     parser.add_argument("--format", choices=("terminal", "markdown", "json"), default="terminal")
     parser.add_argument("--as-of", type=date.fromisoformat, default=date.today(), help="date for retention checks")
     parser.add_argument("--compare", help="baseline JSON audit to compare with the candidate snapshot")
-    parser.add_argument("--finding", action="append", default=[], help="baseline failure to verify (repeatable, requires --compare)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--finding", action="append", default=[], help="baseline check or individual finding ID to verify (repeatable)")
+    mode.add_argument("--monitor", action="store_true", help="report new issues and score or coverage drops since an earlier audit")
     args = parser.parse_args()
-    if args.finding and not args.compare:
-        parser.error("--finding requires --compare")
+    if (args.finding or args.monitor) and not args.compare:
+        parser.error("--finding and --monitor require --compare")
     try:
         snapshot = Snapshot(args.repo, args.rev)
         report = audit(snapshot, load_profile(args.profile, snapshot), args.as_of)
-        result = compare(json.loads(Path(args.compare).read_text()), report, args.finding) if args.compare else None
+        result = (compare(json.loads(Path(args.compare).read_text()), report, args.finding, args.monitor)
+                  if args.compare else None)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(2, f"stillcurrent: {error}\n")
     if result is not None:
@@ -413,8 +482,10 @@ def main():
             print(json.dumps(result, indent=2))
         else:
             if args.format == "markdown":
-                print("# StillCurrent cleanup comparison\n")
+                print("# StillCurrent comparison\n")
             comparison_text(result)
+        if args.monitor:
+            return int(result["alert"])
         return 0 if result["verified"] else 1
     if args.format == "json":
         print(json.dumps(report, indent=2))
