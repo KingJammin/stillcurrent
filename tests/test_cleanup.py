@@ -188,3 +188,63 @@ class CleanupComparison(unittest.TestCase):
         self.assertEqual(evidence["baseline_commit"], evidence["candidate_commit"])
         self.assertTrue(evidence["score_dropped"])
         self.assertEqual([item["path"] for item in evidence["new_findings"]], ["retired.py"])
+
+    def test_local_markdown_headings_and_unsupported_fragments(self):
+        self.write("README.md", """# Setup ##
+
+[Same](#setup)
+[Cross](docs/setup.md#read-caf%C3%A9)
+[Repeated](docs/setup.md#read-café-1)
+[Setext](docs/setup.md#next-steps)
+[Custom](docs/setup.md#manual-ID)
+[Existing code](app.py#L500)
+[Plain view](docs/setup.md?plain=1#L500)
+[Remote](https://example.invalid/page.md#missing)
+[Text fragment](docs/setup.md#:~:text=hello)
+[Bad local](#missing)
+[Ignored heading](docs/setup.md#pretend)
+[Ignored comment heading](docs/setup.md#hidden)
+[Bad cross][cross]
+[cross]: /docs/setup.md#missing
+""")
+        self.write("docs/setup.md", """# Read _Café_
+# Read **Café**
+<a name="manual-ID"></a>
+
+```command text on one line```
+
+Next steps
+----------
+
+~~~markdown
+<!--
+# Pretend
+~~~
+
+<!--
+# Hidden
+-->
+""")
+        self.commit("Add local heading links and controls")
+        result = self.scan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            {row["target"] for row in json.loads(result.stdout)["findings"]
+             if row.get("kind") == "missing_heading"},
+            {"README.md#missing", "docs/setup.md#pretend", "docs/setup.md#hidden",
+             "docs/setup.md#missing"},
+        )
+
+    def test_heading_regression_under_an_already_failing_doc(self):
+        self.save_scored_baseline()
+        self.write("README.md", "[Setup](old-guide.md)\n[Details](docs/setup.md#old-details)\n")
+        self.commit("Add a stale heading under the existing failed check")
+        result = self.scan("--compare", str(self.baseline), "--monitor")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence["baseline_score"], evidence["candidate_score"])
+        self.assertEqual(evidence["regressions"], [])
+        self.assertEqual(
+            [(item["target"], item["kind"]) for item in evidence["new_findings"]],
+            [("docs/setup.md#old-details", "missing_heading")],
+        )

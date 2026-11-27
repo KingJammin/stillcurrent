@@ -24,7 +24,7 @@ Place `.stillcurrent.json` on the revision you want to scan or pass an external 
 | Field | Check |
 | --- | --- |
 | `scope` | Display name for the audit scope. |
-| `docs` | Markdown paths to check for common inline and reference-definition links to tracked local paths. Defaults to tracked root `README.md` and `AGENTS.md`. |
+| `docs` | Markdown paths to check for common inline and reference-definition links to tracked local paths and headings. Defaults to tracked root `README.md` and `AGENTS.md`. |
 | `decisions` | Decision record paths. At the top of each record, add front matter with `status: current` or `status: superseded` and a plain relative `superseded_by: path.md`. A supersession chain must end at a current record. |
 | `claims` | Known stale phrases and their witnesses. Supply `id`, `path`, `stale_contains`, `witness_path`, `witness_contains`, `title`, and `next_step`. A missing witness leaves the check unresolved. |
 | `references` | Supply `id`, `path`, `search` (Git pathspec list), and `expectation` (`move`, `retained`, or `retire`). Search for the file path or supply a literal `token`, including a URL or filename when applicable. `retained` can require a `path_contains` witness in the retained file. A still-tracked retirement candidate with no matches is unresolved. |
@@ -36,7 +36,7 @@ Claim, reference, and artifact rules accept `impact` of `high`, `medium`, or `lo
 
 Knowledge contributes 40%, code and assets 35%, and artifacts 25%. Each area score is passes divided by evaluated checks. Coverage is evaluated checks divided by configured checks in that area. An area needs at least 80% coverage, and critical checks must be resolved, before the tool reports a weighted total. A default scan without code or asset checks will withhold the total.
 
-The report shows checklist coverage. Generalizing beyond those checks requires a broader profile. Link checks cover local file paths. Anchors, external links, and claims about deployed environments require separate evidence. Literal references miss dynamically generated paths and consumers outside the snapshot. Confirm those consumers and retention requirements before removing anything.
+The report shows checklist coverage. Generalizing beyond those checks requires a broader profile. Heading checks cover same-file and cross-file links to local `.md` and `.markdown` sections, including common GitHub-style heading IDs, duplicate headings, and explicit HTML anchors. External URLs, code-view line fragments, and anchors added by site generators require separate evidence. Literal references miss dynamically generated paths and consumers outside the snapshot. Confirm those consumers and retention requirements before removing anything.
 
 ## Verify a cleanup
 
@@ -53,7 +53,7 @@ Repeat `--finding` to verify several fixes. A check ID such as `doc:README.md` r
 
 New individual findings or checks that lose evidence block verification even when the score stays the same. JSON comparisons include `new_findings`, `resolved_findings`, and check status changes in `regressions`. Finding IDs use the check, affected path, link target when present, and occurrence count for repeated matches. Moving a line alone keeps its ID. Multiple matches of the same rule and target in one file are tracked by count.
 
-Cleanup comparison exits 0 for verified, 1 for unverified, and 2 for incompatible scans or invalid input. When upgrading from 0.2.0 or changing profiles, rescan the original baseline commit before comparing.
+Cleanup comparison exits 0 for verified, 1 for unverified, and 2 for incompatible scans or invalid input. After changing the scanner version or profile, rescan the original baseline commit before comparing.
 
 The [cleanup skill](.agents/skills/stillcurrent-cleanup/SKILL.md) guides AI agents through evidence review, scoped edits, and the repository’s own verification. Point an agent at the skill and the finding ID.
 
