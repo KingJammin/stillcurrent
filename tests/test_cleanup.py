@@ -41,12 +41,9 @@ class CleanupComparison(unittest.TestCase):
             ],
         }
         self.profile_path = self.root / "profile.json"
-        self.profile_path.write_text(json.dumps(self.profile))
-        self.commit("Stale guide, live prototype and retired file")
-        audit = self.scan()
-        self.assertEqual(audit.returncode, 0, audit.stderr)
         self.baseline = self.root / "before.json"
-        self.baseline.write_text(audit.stdout)
+        self.commit("Stale guide, live prototype and retired file")
+        self.save_baseline()
 
     def git(self, *args):
         return subprocess.run(
@@ -74,6 +71,20 @@ class CleanupComparison(unittest.TestCase):
     def compare(self, *findings):
         arguments = [argument for finding in findings for argument in ("--finding", finding)]
         return self.scan("--compare", str(self.baseline), *arguments)
+
+    def save_baseline(self):
+        self.profile_path.write_text(json.dumps(self.profile))
+        audit = self.scan()
+        self.assertEqual(audit.returncode, 0, audit.stderr)
+        self.baseline.write_text(audit.stdout)
+        return json.loads(audit.stdout)
+
+    def save_scored_baseline(self):
+        # The retirement candidate is unreferenced but still tracked, so its
+        # reference check would lower code coverage enough to withhold the score.
+        self.profile["references"] = [rule for rule in self.profile["references"]
+                                      if rule["id"] != "retired"]
+        self.assertIsNotNone(self.save_baseline()["score"])
 
     def apply_fixes(self):
         self.write("README.md", "[Setup](docs/setup.md)\n")
@@ -133,6 +144,7 @@ class CleanupComparison(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["remaining"], ["doc:README.md"])
 
     def test_new_broken_link_is_detected_at_the_same_score(self):
+        self.save_scored_baseline()
         self.write("README.md", "\n[Setup](./old-guide.md)\n[New](new-guide.md)\n")
         self.commit("Move the old link and introduce another broken link")
         cleanup = self.compare("doc:README.md")
@@ -155,10 +167,8 @@ class CleanupComparison(unittest.TestCase):
     def test_selected_link_can_clear_while_other_links_remain(self):
         self.write("README.md", "[Setup](old-guide.md)\n[Other](another-guide.md)\n")
         self.commit("Record two broken links")
-        baseline = self.scan()
-        self.assertEqual(baseline.returncode, 0, baseline.stderr)
-        self.baseline.write_text(baseline.stdout)
-        target = next(item for item in json.loads(baseline.stdout)["findings"]
+        baseline = self.save_baseline()
+        target = next(item for item in baseline["findings"]
                       if item.get("target") == "old-guide.md")
         self.write("README.md", "[Setup](docs/setup.md)\n[Other](another-guide.md)\n")
         self.commit("Fix just the selected link")
@@ -168,10 +178,7 @@ class CleanupComparison(unittest.TestCase):
 
     def test_monitor_notices_retention_expiry_on_the_same_commit(self):
         self.profile["artifact_rules"][0]["retain_until"] = DATE
-        self.profile_path.write_text(json.dumps(self.profile))
-        baseline = self.scan()
-        self.assertEqual(baseline.returncode, 0, baseline.stderr)
-        self.baseline.write_text(baseline.stdout)
+        self.save_scored_baseline()
         unchanged = self.scan("--compare", str(self.baseline), "--monitor")
         self.assertEqual(unchanged.returncode, 0, unchanged.stderr)
         self.assertFalse(json.loads(unchanged.stdout)["alert"])
