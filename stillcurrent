@@ -6,20 +6,25 @@ from collections import Counter
 from datetime import date
 from fnmatch import fnmatchcase
 import hashlib
+from html import unescape
 import json
 from pathlib import Path
 import posixpath
 import re
 import subprocess
 import sys
-from urllib.parse import unquote, urlsplit
+import unicodedata
+from urllib.parse import parse_qs, unquote, urlsplit
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 WEIGHTS = {"knowledge": 40, "code_assets": 35, "artifacts": 25}
 CATEGORIES = ("docs", "decisions", "claims", "references", "artifact_rules")
 INLINE_LINK = re.compile(r"""!?\[[^\]\n]*\]\(\s*(?:<([^>]+)>|([^\s()]+))(?:\s+["'][^"']*["'])?\s*\)""")
 DEFINITION = re.compile(r"""^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))""")
 FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*)|$)")
+SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+CUSTOM_ANCHOR = re.compile(r"""<[A-Za-z][\w:-]*\b[^>]*?\s(?:id|name)\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.I)
 
 
 class Snapshot:
@@ -33,6 +38,7 @@ class Snapshot:
             mode, _, oid = metadata.decode().split()
             self.paths[path.decode("utf-8", "surrogateescape")] = (mode, oid)
         self.cache = {}
+        self.anchor_cache = {}
         self.directories = set()
         for path in self.paths:
             directory = posixpath.dirname(path)
@@ -60,6 +66,12 @@ class Snapshot:
 
     def exists(self, path):
         return path in self.paths or path in self.directories or path == "."
+
+    def anchors(self, path):
+        if path not in self.anchor_cache:
+            content = self.read(path)
+            self.anchor_cache[path] = heading_anchors(content) if content is not None else None
+        return self.anchor_cache[path]
 
     def references(self, token, paths, excluded):
         output = self.git(
@@ -92,10 +104,11 @@ def literal_lines(content, needle):
     return [number for number, line in enumerate((content or "").splitlines(), 1) if needle in line]
 
 
-def links(content):
+def markdown_lines(content):
     fence = ""
+    in_comment = False
     for number, line in enumerate(content.splitlines(), 1):
-        match = FENCE.match(line)
+        match = FENCE.match(line) if not in_comment else None
         if match:
             marker = match[1]
             if not fence:
@@ -104,7 +117,20 @@ def links(content):
                 fence = ""
             continue
         if fence or line.startswith(("    ", "\t")):
+            yield number, ""
             continue
+        if in_comment:
+            _, end, line = line.partition("-->")
+            in_comment = not end
+        line = re.sub(r"<!--.*?-->", "", line)
+        if "<!--" in line:
+            line = line.split("<!--", 1)[0]
+            in_comment = True
+        yield number, line
+
+
+def links(content):
+    for number, line in markdown_lines(content):
         line = re.sub(r"`+[^`]*`+", "", line)
         definition = DEFINITION.match(line)
         if definition:
@@ -113,16 +139,61 @@ def links(content):
             yield number, next(group for group in inline.groups() if group)
 
 
-def local_path(source, target):
+def local_url(target):
     try:
         url = urlsplit(target)
     except ValueError:
         return None
-    if url.scheme or url.netloc or not url.path:
+    return url if not url.scheme and not url.netloc else None
+
+
+def local_path(source, url):
+    if not url.path:
         return None
     path = unquote(url.path)
     parent = "" if path.startswith("/") else posixpath.dirname(source)
     return posixpath.normpath(posixpath.join(parent, path.lstrip("/")))
+
+
+def heading_slug(text):
+    text = INLINE_LINK.sub(lambda match: match[0].split("](", 1)[0].removeprefix("!").removeprefix("["), text)
+    text = re.sub(r"!?\[([^\]]+)\]\[[^\]]*\]", r"\1", text)
+    text = re.sub(r"</?[A-Za-z][^>]*>", "", text)
+    text = re.sub(r"(?<!\w)(__|_)(\S(?:.*?\S)?)\1(?!\w)", r"\2", text)
+    return "".join(
+        "-" if char == " " else char for char in unescape(text).strip().lower()
+        if char in " -_" or unicodedata.category(char)[0] in "LMN"
+    )
+
+
+def heading_anchors(content):
+    explicit = set()
+    slugs = set()
+    counts = Counter()
+    previous = ""
+    previous_line = 0
+    for number, line in markdown_lines(content):
+        # Inline code may contain example tags rather than actual anchors.
+        html = re.sub(r"`+[^`]*`+", "", line)
+        explicit.update(unescape(m[1] or m[2]) for m in CUSTOM_ANCHOR.finditer(html))
+        atx = ATX.match(line)
+        if atx:
+            heading = re.sub(r"(?:^|[ \t]+)#+[ \t]*$", "", atx[1] or "")
+        elif number == previous_line + 1 and previous and SETEXT.fullmatch(line):
+            heading = previous
+        else:
+            previous = line if line.strip() and not re.match(r"^ {0,3}(?:[<>|]|[-+*]\s|\d+[.)]\s)", line) else ""
+            previous_line = number
+            continue
+        slug = heading_slug(heading)
+        if slug:
+            anchor = slug
+            while anchor in slugs:
+                counts[slug] += 1
+                anchor = f"{slug}-{counts[slug]}"
+            slugs.add(anchor)
+        previous = ""
+    return slugs | explicit
 
 
 def decision_metadata(content):
@@ -141,7 +212,8 @@ def audit_decision(snapshot, path):
             outcome = "pass"
             title = "Decision resolves to a current record"
             break
-        target = local_path(visited[-1], metadata.get("superseded_by", "").strip())
+        url = local_url(metadata.get("superseded_by", "").strip())
+        target = local_path(visited[-1], url) if url else None
         if status != "superseded" or not target or target in visited:
             outcome = "fail"
             title = "Decision does not resolve to a current record"
@@ -161,12 +233,23 @@ def audit_doc(snapshot, path):
                       "Update the guide path and rerun the scan.", [location(path)])]
     missing = []
     for line, target in links(content):
-        resolved = local_path(path, target)
-        if resolved is not None and not snapshot.exists(resolved):
-            missing.append({**location(path, line), "target": resolved})
+        url = local_url(target)
+        if url is None:
+            continue
+        resolved = local_path(path, url) or path
+        if not snapshot.exists(resolved):
+            missing.append({**location(path, line), "target": resolved, "kind": "missing_path"})
+            continue
+        fragment = unquote(url.fragment).split(":~:", 1)[0]
+        rendered_markdown = (resolved.lower().endswith((".md", ".markdown"))
+                             and parse_qs(url.query).get("plain") != ["1"])
+        if fragment and rendered_markdown:
+            anchors = snapshot.anchors(resolved)
+            if anchors is not None and fragment not in anchors:
+                missing.append({**location(path, line), "target": f"{resolved}#{fragment}", "kind": "missing_heading"})
     result = check(
         "doc", path, "knowledge", "fail" if missing else "pass",
-        "Guide links to missing tracked paths" if missing else "Guide’s local paths resolve",
+        "Guide has broken local links" if missing else "Guide’s local links resolve",
         "Update each link to its current destination.", missing or [location(path)],
     )
     return [result]
