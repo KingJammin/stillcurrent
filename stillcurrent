@@ -111,11 +111,13 @@ def markdown_lines(content):
         match = FENCE.match(line) if not in_comment else None
         if match:
             marker = match[1]
-            if not fence:
+            tail = line[match.end():]
+            if not fence and (marker[0] == "~" or "`" not in tail):
                 fence = marker
-            elif marker.startswith(fence) and not line[match.end():].strip():
+                continue
+            if fence and marker.startswith(fence) and not tail.strip():
                 fence = ""
-            continue
+                continue
         if fence or line.startswith(("    ", "\t")):
             yield number, ""
             continue

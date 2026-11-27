@@ -211,6 +211,8 @@ class CleanupComparison(unittest.TestCase):
 # Read **Café**
 <a name="manual-ID"></a>
 
+```command text on one line```
+
 Next steps
 ----------
 
